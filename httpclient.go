@@ -8,13 +8,33 @@ import (
 )
 
 // requestAnalyticsAPI makes the GET request to Moonito analytics endpoint and returns response body.
-func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string) (string, error) {
+// visitorContext carries the optional inputs the rotation detectors need.
+// Without them the API can only judge a request on its own address and user
+// agent, which is exactly what a rotating residential pool is built to defeat.
+// A zero value sends nothing extra and behaves exactly as before.
+type visitorContext struct {
+	ClientToken string
+	Headers     map[string]string
+}
+
+func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string, ctx visitorContext) (string, error) {
 	values := url.Values{}
 	values.Set("ip", ip)
 	// Do not double-encode: url.Values will encode properly
 	values.Set("ua", userAgent)
 	values.Set("events", event)
 	values.Set("domain", domain)
+	values.Set("sdk", "go/"+SDKVersion)
+
+	if ctx.ClientToken != "" {
+		values.Set("client_token", ctx.ClientToken)
+	}
+
+	for name, value := range ctx.Headers {
+		if len(value) <= 2048 {
+			values.Set("headers["+name+"]", value)
+		}
+	}
 
 	u := apiBaseURL + "?" + values.Encode()
 

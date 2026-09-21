@@ -15,6 +15,10 @@ const (
 	BYPASS_HEADER       = "X-VTF-Bypass"
 	BYPASS_TOKEN_HEADER = "X-VTF-Token"
 	apiBaseURL          = "https://moonito.net/api/v1/analytics"
+	identityCookie      = "__mo_ct"
+	// SDKVersion is reported to the API so support can tell which build a
+	// customer is running.
+	SDKVersion = "2.0.0"
 )
 
 // API response partial struct (adapted for the API contract)
@@ -24,6 +28,11 @@ type analyticsAPIResponse struct {
 			NeedToBlock    bool   `json:"need_to_block"`
 			DetectActivity string `json:"detect_activity"`
 		} `json:"status"`
+		SetClientToken *struct {
+			Name   string `json:"name"`
+			Value  string `json:"value"`
+			MaxAge int    `json:"max_age"`
+		} `json:"set_client_token"`
 	} `json:"data"`
 	Error *struct {
 		Message any `json:"message"`
@@ -57,7 +66,10 @@ func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 		return errors.New("invalid IP address")
 	}
 
-	respBody, err := c.requestAnalyticsAPI(clientIP, ua, event, domain)
+	respBody, err := c.requestAnalyticsAPI(clientIP, ua, event, domain, visitorContext{
+		ClientToken: readClientToken(r),
+		Headers:     collectHeaders(r),
+	})
 	if err != nil {
 		return fmt.Errorf("request analytics API: %w", err)
 	}
@@ -71,11 +83,82 @@ func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("analytics error: %v", apiResp.Error.Message)
 	}
 
+	writeClientToken(w, apiResp.Data.SetClientToken)
+
 	if apiResp.Data.Status.NeedToBlock {
 		c.handleBlockedVisitor(w, r)
 	}
 
 	return nil
+}
+
+// readClientToken returns the visitor's identity token, if they carry one.
+//
+// Read without any attempt to validate it. The SDK cannot: the signing key is
+// server side and shipping it to every install would make it public. Holding a
+// token confers no trust, it only tells the API whose history to consult, so
+// passing a forged one along is harmless.
+func readClientToken(r *http.Request) string {
+	cookie, err := r.Cookie(identityCookie)
+	if err != nil || cookie == nil {
+		return ""
+	}
+
+	if len(cookie.Value) == 0 || len(cookie.Value) > 96 {
+		return ""
+	}
+
+	return cookie.Value
+}
+
+// collectHeaders returns the request headers for server side fingerprinting,
+// minus anything that carries the visitor's own credentials.
+func collectHeaders(r *http.Request) map[string]string {
+	out := make(map[string]string, len(r.Header))
+
+	for name, values := range r.Header {
+		switch strings.ToLower(name) {
+		case "cookie", "authorization", "proxy-authorization":
+			continue
+		}
+
+		if len(values) > 0 {
+			out[name] = values[0]
+		}
+	}
+
+	return out
+}
+
+// writeClientToken stores the token the API handed back, so the next request
+// from this visitor carries it.
+func writeClientToken(w http.ResponseWriter, descriptor *struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	MaxAge int    `json:"max_age"`
+}) {
+	if descriptor == nil || descriptor.Value == "" {
+		return
+	}
+
+	name := descriptor.Name
+	if name == "" {
+		name = identityCookie
+	}
+
+	maxAge := descriptor.MaxAge
+	if maxAge <= 0 {
+		maxAge = 7776000
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    descriptor.Value,
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: false,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // EvaluateVisitorManually: useful for offline checks, background jobs, or tests.
@@ -111,7 +194,7 @@ func (c *Client) EvaluateVisitorManually(ip, userAgent, event, domain string) (m
 		return nil, errors.New("invalid IP address")
 	}
 
-	respBody, err := c.requestAnalyticsAPI(ip, userAgent, event, domain)
+	respBody, err := c.requestAnalyticsAPI(ip, userAgent, event, domain, visitorContext{})
 	if err != nil {
 		return nil, fmt.Errorf("request analytics API: %w", err)
 	}

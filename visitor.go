@@ -14,8 +14,9 @@ import (
 const (
 	BYPASS_HEADER       = "X-VTF-Bypass"
 	BYPASS_TOKEN_HEADER = "X-VTF-Token"
-	apiBaseURL          = "https://moonito.net/api/v1/analytics"
+	defaultEndpoint     = "https://moonito.net"
 	identityCookie      = "__mo_ct"
+	passCookie          = "__mo_pass"
 	// SDKVersion is reported to the API so support can tell which build a
 	// customer is running.
 	SDKVersion = "2.0.0"
@@ -33,6 +34,7 @@ type analyticsAPIResponse struct {
 			Value  string `json:"value"`
 			MaxAge int    `json:"max_age"`
 		} `json:"set_client_token"`
+		ChallengeURL string `json:"challenge_url"`
 	} `json:"data"`
 	Error *struct {
 		Message any `json:"message"`
@@ -67,8 +69,11 @@ func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	respBody, err := c.requestAnalyticsAPI(clientIP, ua, event, domain, visitorContext{
-		ClientToken: readClientToken(r),
-		Headers:     collectHeaders(r),
+		ClientToken:   readClientToken(r),
+		ChallengePass: readChallengePass(r),
+		Headers:       collectHeaders(r),
+		Method:        r.Method,
+		Path:          r.URL.Path,
 	})
 	if err != nil {
 		return fmt.Errorf("request analytics API: %w", err)
@@ -87,9 +92,109 @@ func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 
 	if apiResp.Data.Status.NeedToBlock {
 		c.handleBlockedVisitor(w, r)
+		return nil
+	}
+
+	// A challenge is outranked by a block, so it is only considered once the
+	// visitor was not blocked outright.
+	if apiResp.Data.ChallengeURL != "" {
+		switch c.cfg.ChallengeAction {
+		case "challenge":
+			renderChallenge(w, r, apiResp.Data.ChallengeURL)
+		case "block":
+			c.handleBlockedVisitor(w, r)
+		}
+		// Anything else, including the empty default, is an allow: the verdict
+		// is logged server side and the visitor is not interrupted.
 	}
 
 	return nil
+}
+
+// readChallengePass returns the proof that this visitor already passed a
+// challenge. Forwarded without validation: the pass is signed with the domain
+// secret, so checking it here would mean reimplementing the MAC in every
+// language. The server checks it, and a forged one simply fails there.
+func readChallengePass(r *http.Request) string {
+	cookie, err := r.Cookie(passCookie)
+	if err != nil || cookie == nil || len(cookie.Value) > 1024 {
+		return ""
+	}
+	return cookie.Value
+}
+
+// renderChallenge sends the visitor to the challenge, keeping their request.
+//
+// A plain redirect would be simpler and would lose every POST. Somebody halfway
+// through a checkout would return to an empty form and blame the site, so the
+// body is stashed in sessionStorage on the customer's own origin and replayed
+// when the challenge sends them back.
+//
+// The stash cannot hold a file input, because script cannot put a file back
+// into a form. That is said plainly rather than silently dropped.
+func renderChallenge(w http.ResponseWriter, r *http.Request, challengeURL string) {
+	fields := map[string]string{}
+	hasUpload := false
+
+	if r.Method == http.MethodPost {
+		contentType := r.Header.Get("Content-Type")
+		hasUpload = strings.HasPrefix(contentType, "multipart/form-data")
+
+		if !hasUpload {
+			// ParseForm consumes the body. That is acceptable here because the
+			// response is this interstitial and the original request is being
+			// replayed rather than served.
+			if err := r.ParseForm(); err == nil {
+				for name, values := range r.PostForm {
+					if len(fields) >= 200 {
+						break
+					}
+					if len(values) > 0 && len(values[0]) <= 8192 {
+						fields[name] = values[0]
+					}
+				}
+			}
+		}
+	}
+
+	stash, err := json.Marshal(map[string]any{
+		"u": r.URL.RequestURI(),
+		"m": r.Method,
+		"f": fields,
+	})
+	if err != nil {
+		stash = []byte("{}")
+	}
+
+	// Encoded twice: once for the value, once so the result is a JavaScript
+	// string literal. Then < is escaped so it cannot close the script element.
+	payload, _ := json.Marshal(string(stash))
+	target, _ := json.Marshal(challengeURL)
+
+	safe := func(b []byte) string {
+		return strings.ReplaceAll(string(b), "<", `\u003c`)
+	}
+
+	note := ""
+	if hasUpload {
+		note = "<p>You will need to choose your file again after this check.</p>"
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, private")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.WriteHeader(http.StatusOK)
+
+	fmt.Fprint(w, `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">`+
+		`<meta name="viewport" content="width=device-width, initial-scale=1">`+
+		`<meta name="robots" content="noindex, nofollow">`+
+		`<title>Checking your browser</title></head>`+
+		`<body><p>Checking your browser before you continue.</p>`+note+
+		`<script>(function(){try{sessionStorage.setItem("__mo_resume",`+safe(payload)+
+		`);}catch(e){}location.replace(`+safe(target)+`);})();</script>`+
+		`<noscript><p>JavaScript is required to continue.</p></noscript>`+
+		`</body></html>`)
 }
 
 // readClientToken returns the visitor's identity token, if they carry one.

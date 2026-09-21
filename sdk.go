@@ -7,6 +7,21 @@ type Config struct {
 	APISecretKey          string
 	UnwantedVisitorTo     string
 	UnwantedVisitorAction int
+	// Endpoint overrides the API base. Empty means https://moonito.net.
+	Endpoint string
+
+	// ChallengeAction decides what happens when the engine asks for a
+	// challenge:
+	//
+	//   "allow"      treat it as an allow and log it. The default.
+	//   "block"      treat it as a block.
+	//   "challenge"  actually show the interstitial.
+	//
+	// Empty means "allow", on purpose and matching the PHP SDK. Turning a
+	// scored challenge into a real page interruption changes what a visitor
+	// sees, and that is the site owner's decision, not a side effect of taking
+	// an upgrade.
+	ChallengeAction string
 	// Optionally you can add HTTP client config, timeouts, logger, etc.
 }
 

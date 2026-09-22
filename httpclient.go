@@ -6,7 +6,19 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// http.DefaultClient has no timeout, so every call here could wait for as long
+// as the socket stayed open and the visitor's page waited with it. The install
+// snippet already promised callers "bounded timeouts"; this is what makes that
+// true.
+//
+// Generous rather than tight: a check that gives up early is recorded as
+// "could not run" and the visitor is let through unchecked, which is the
+// failure this library exists to prevent. EvaluateVisitor fails open, so the
+// worst a timeout costs is one slow page, not a broken one.
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // visitorContext carries the optional inputs the rotation detectors need.
 // Without them the API can only judge a request on its own address and user
@@ -86,7 +98,7 @@ func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string, ctx vi
 	req.Header.Set("X-Public-Key", c.cfg.APIPublicKey)
 	req.Header.Set("X-Secret-Key", c.cfg.APISecretKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -116,7 +128,7 @@ func (c *Client) httpRequestWithBypass(rawURL string) (string, error) {
 	req.Header.Set(BYPASS_HEADER, "1")
 	req.Header.Set(BYPASS_TOKEN_HEADER, c.bypassToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}

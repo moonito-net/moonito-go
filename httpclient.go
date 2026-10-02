@@ -2,23 +2,33 @@ package moonitogo
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 )
 
-// http.DefaultClient has no timeout, so every call here could wait for as long
-// as the socket stayed open and the visitor's page waited with it. The install
-// snippet already promised callers "bounded timeouts"; this is what makes that
-// true.
-//
-// Generous rather than tight: a check that gives up early is recorded as
-// "could not run" and the visitor is let through unchecked, which is the
-// failure this library exists to prevent. EvaluateVisitor fails open, so the
-// worst a timeout costs is one slow page, not a broken one.
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+// Only reaching the API is timed. Once connected the SDK waits for the
+// decision however long it takes, because a check that gives up early lets the
+// visitor through unchecked, and blocking them is the reason this library is
+// installed. The request still ends when the visitor goes away, since it
+// carries the visitor's request context.
+var httpClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// contentClient fetches the unwanted-visitor page for action 3, which is
+// somebody else's site and gets a normal bounded timeout.
+var contentClient = &http.Client{Timeout: 15 * time.Second}
 
 // visitorContext carries the optional inputs the rotation detectors need.
 // Without them the API can only judge a request on its own address and user
@@ -30,6 +40,7 @@ type visitorContext struct {
 	Headers       map[string]string
 	Method        string
 	Path          string
+	Context       context.Context
 }
 
 // requestAnalyticsAPI asks the decision API what to do with this visitor.
@@ -98,6 +109,10 @@ func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string, ctx vi
 	req.Header.Set("X-Public-Key", c.cfg.APIPublicKey)
 	req.Header.Set("X-Secret-Key", c.cfg.APISecretKey)
 
+	if ctx.Context != nil {
+		req = req.WithContext(ctx.Context)
+	}
+
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
@@ -128,7 +143,7 @@ func (c *Client) httpRequestWithBypass(rawURL string) (string, error) {
 	req.Header.Set(BYPASS_HEADER, "1")
 	req.Header.Set(BYPASS_TOKEN_HEADER, c.bypassToken)
 
-	resp, err := httpClient.Do(req)
+	resp, err := contentClient.Do(req)
 	if err != nil {
 		return "", err
 	}

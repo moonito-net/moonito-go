@@ -19,7 +19,7 @@ const (
 	passCookie          = "__mo_pass"
 	// SDKVersion is reported to the API so support can tell which build a
 	// customer is running.
-	SDKVersion = "2.0.0"
+	SDKVersion = "1.3.0"
 )
 
 // API response partial struct (adapted for the API contract)
@@ -41,9 +41,57 @@ type analyticsAPIResponse struct {
 	} `json:"error"`
 }
 
-// EvaluateVisitor inspects the incoming HTTP request and optionally writes a response
-// if the visitor needs to be blocked. Returns nil on normal flow or an error on internal problems.
+// Middleware protects every route behind it. A blocked visitor gets the
+// unwanted-visitor response and next is never called, so the protected page is
+// not sent to them. This is the easiest way to install the SDK:
+//
+//	http.ListenAndServe(":3000", client.Middleware(mux))
+func (c *Client) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tracked := &writeTracker{ResponseWriter: w}
+		_ = c.EvaluateVisitor(tracked, r)
+
+		if tracked.wrote {
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// writeTracker records whether EvaluateVisitor answered the request itself.
+type writeTracker struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (t *writeTracker) WriteHeader(code int) {
+	t.wrote = true
+	t.ResponseWriter.WriteHeader(code)
+}
+
+func (t *writeTracker) Write(b []byte) (int, error) {
+	t.wrote = true
+	return t.ResponseWriter.Write(b)
+}
+
+// EvaluateVisitor inspects the incoming HTTP request and writes the
+// unwanted-visitor response when the visitor must be blocked.
+//
+// It fails open and always returns nil: when the check cannot run (the API is
+// unreachable or refuses, for example on an expired plan) the visitor is let
+// through and the reason is logged. The error return is kept so existing code
+// still compiles. When calling it directly, check whether a response was
+// written before serving the page; Middleware does that for you.
 func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
+	if err := c.evaluateVisitor(w, r); err != nil {
+		log.Printf("moonito: check could not run, visitor allowed: %v", err)
+	}
+
+	return nil
+}
+
+func (c *Client) evaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 	if !c.cfg.IsProtected {
 		return nil
 	}
@@ -59,7 +107,7 @@ func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	clientIP := getClientIP(r)
+	clientIP := c.clientIP(r)
 	ua := r.UserAgent()
 	event := r.URL.RequestURI()
 	domain := strings.ToLower(r.Host)
@@ -74,6 +122,7 @@ func (c *Client) EvaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 		Headers:       collectHeaders(r),
 		Method:        r.Method,
 		Path:          r.URL.Path,
+		Context:       r.Context(),
 	})
 	if err != nil {
 		return fmt.Errorf("request analytics API: %w", err)
@@ -295,22 +344,28 @@ func (c *Client) EvaluateVisitorManually(ip, userAgent, event, domain string) (m
 		}
 	}
 
+	// Only an unusable input is an error. When the check itself cannot run
+	// the visitor is reported as allowed, the same fail-open rule as
+	// EvaluateVisitor, and the reason is logged.
 	if !isValidIP(ip) {
 		return nil, errors.New("invalid IP address")
 	}
 
 	respBody, err := c.requestAnalyticsAPI(ip, userAgent, event, domain, visitorContext{})
 	if err != nil {
-		return nil, fmt.Errorf("request analytics API: %w", err)
+		log.Printf("moonito: check could not run, visitor allowed: %v", err)
+		return result, nil
 	}
 
 	var apiResp analyticsAPIResponse
 	if err := json.Unmarshal([]byte(respBody), &apiResp); err != nil {
-		return nil, fmt.Errorf("invalid analytics response: %w", err)
+		log.Printf("moonito: unusable API response, visitor allowed: %v", err)
+		return result, nil
 	}
 
 	if apiResp.Error != nil {
-		return nil, fmt.Errorf("analytics error: %v", apiResp.Error.Message)
+		log.Printf("moonito: API refused the check, visitor allowed: %v", apiResp.Error.Message)
+		return result, nil
 	}
 
 	need := apiResp.Data.Status.NeedToBlock

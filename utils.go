@@ -45,23 +45,95 @@ func isValidIP(ip string) bool {
 	return net.ParseIP(ip) != nil
 }
 
-func getClientIP(r *http.Request) string {
-	// Try Cloudflare header then X-Forwarded-For then RemoteAddr
-	if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-		return cf
-	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	// if RemoteAddr includes port, strip it
-	if r.RemoteAddr != "" {
-		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			return host
+// cloudflareRanges are Cloudflare's published edge ranges. CF-Connecting-IP is
+// only read from a connection that comes from one of them.
+var cloudflareRanges = parseRanges([]string{
+	"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+	"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+	"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+	"2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+	"2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+})
+
+func parseRanges(entries []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if !strings.Contains(entry, "/") {
+			if ip := net.ParseIP(entry); ip != nil {
+				bits := 128
+				if ip.To4() != nil {
+					bits = 32
+				}
+				out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			}
+			continue
 		}
-		return r.RemoteAddr
+		if _, n, err := net.ParseCIDR(entry); err == nil {
+			out = append(out, n)
+		}
 	}
-	return ""
+	return out
+}
+
+func inRanges(ip net.IP, ranges []*net.IPNet) bool {
+	for _, n := range ranges {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivateIP(ip net.IP) bool {
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		(ip.To4() != nil && ip.To4()[0] == 100 && ip.To4()[1]&0xC0 == 64)
+}
+
+// clientIP returns the visitor's address.
+//
+// Forwarded headers are set by whoever makes the request, so they are only
+// believed when the connection came from a proxy: a private address, one
+// listed in TrustedProxies, or Cloudflare for CF-Connecting-IP. Reading them
+// unconditionally let a bot claim any clean address it liked.
+func (c *Client) clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+
+	remote := net.ParseIP(host)
+	if remote == nil {
+		return ""
+	}
+
+	trusted := parseRanges(c.cfg.TrustedProxies)
+	fromCloudflare := inRanges(remote, cloudflareRanges)
+
+	if !fromCloudflare && !isPrivateIP(remote) && !inRanges(remote, trusted) {
+		return remote.String()
+	}
+
+	if fromCloudflare {
+		if cf := net.ParseIP(strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))); cf != nil {
+			return cf.String()
+		}
+	}
+
+	parts := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		candidate := net.ParseIP(strings.Trim(strings.TrimSpace(parts[i]), "[]"))
+		if candidate == nil {
+			continue
+		}
+		if isPrivateIP(candidate) || inRanges(candidate, trusted) || inRanges(candidate, cloudflareRanges) {
+			continue
+		}
+		return candidate.String()
+	}
+
+	return remote.String()
 }
 
 func getCurrentURL(r *http.Request) string {

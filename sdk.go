@@ -22,7 +22,11 @@ type Config struct {
 	// sees, and that is the site owner's decision, not a side effect of taking
 	// an upgrade.
 	ChallengeAction string
-	// Optionally you can add HTTP client config, timeouts, logger, etc.
+
+	// TrustedProxies lists public proxy or load balancer addresses (single
+	// IPs or CIDR ranges) whose X-Forwarded-For may be believed. Private
+	// addresses and Cloudflare are recognised without being listed.
+	TrustedProxies []string
 }
 
 // Client is the main SDK client.

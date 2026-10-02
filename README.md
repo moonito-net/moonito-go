@@ -38,50 +38,47 @@ go get github.com/moonito-net/moonito-go
 
 ---
 
-## Quick Start (with Echo)
+## Quick Start (net/http)
 
 ```go
 package main
 
 import (
+	"log"
 	"net/http"
-	"github.com/labstack/echo/v4"
-	"github.com/moonito-net/moonito-go"
+
+	moonito "github.com/moonito-net/moonito-go"
 )
 
 func main() {
-	e := echo.New()
-
-	// Initialize Moonito
 	client := moonito.New(moonito.Config{
 		IsProtected:           true,
 		APIPublicKey:          "YOUR_PUBLIC_KEY",
 		APISecretKey:          "YOUR_SECRET_KEY",
 		UnwantedVisitorTo:     "https://example.com/blocked", // URL or HTTP status code
-		UnwantedVisitorAction: 1, // 1 = Redirect, 2 = Iframe, 3 = Load content
+		UnwantedVisitorAction: 1,                             // 1 = Redirect, 2 = Iframe, 3 = Load content
 	})
 
-	// Global middleware
-	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			blocked, err := client.EvaluateRequest(c.Request())
-			if err != nil {
-				return c.String(http.StatusInternalServerError, err.Error())
-			}
-			if blocked {
-				return c.String(http.StatusForbidden, "Access Denied")
-			}
-			return next(c)
-		}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Hello, World!"))
 	})
 
-	e.GET("/", func(c echo.Context) error {
-		return c.String(http.StatusOK, "Hello, World!")
-	})
-
-	e.Start(":8080")
+	// Unwanted visitors are answered by Moonito and never reach your routes.
+	log.Fatal(http.ListenAndServe(":8080", client.Middleware(mux)))
 }
 ```
+
+## Quick Start (Echo)
+
+```go
+import "github.com/moonito-net/moonito-go/middleware"
+
+e := echo.New()
+e.Use(middleware.EchoTrafficFilter(client))
+```
+
+If the check cannot run (the API is unreachable, or refuses because a plan expired) the visitor is let through and the reason is logged. Moonito never turns into an error page on your site.
 
 ---
 
@@ -94,6 +91,7 @@ func main() {
 | `APISecretKey` | `string` | Your Moonito API secret key (required) |
 | `UnwantedVisitorTo` | `string` | URL to redirect unwanted visitors or HTTP error code |
 | `UnwantedVisitorAction` | `int` | Action for unwanted visitors: `1` = Redirect, `2` = Iframe, `3` = Load content |
+| `TrustedProxies` | `[]string` | Optional. Public proxy or load balancer IPs/CIDRs whose `X-Forwarded-For` is trusted. Private proxies and Cloudflare are recognised automatically |
 
 ---
 

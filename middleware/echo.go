@@ -1,9 +1,6 @@
 package middleware
 
 import (
-	"net/http"
-	"strings"
-
 	"github.com/labstack/echo/v4"
 	"github.com/moonito-net/moonito-go"
 )
@@ -15,11 +12,10 @@ func EchoTrafficFilter(client *moonitogo.Client) echo.MiddlewareFunc {
 			// Quick skip for health or static endpoints if needed:
 			// if strings.HasPrefix(c.Request().URL.Path, "/health") { return next(c) }
 
-			// run the visitor evaluation
-			if err := client.EvaluateVisitor(c.Response(), c.Request()); err != nil {
-				// on internal error, return 500
-				return c.String(http.StatusInternalServerError, "Internal Server Error")
-			}
+			// EvaluateVisitor fails open: when the check cannot run it logs
+			// the reason and the visitor continues. A protection problem must
+			// never become a 500 on the customer's site.
+			_ = client.EvaluateVisitor(c.Response(), c.Request())
 			// if client already wrote a response (blocked visitor) do not continue
 			if c.Response().Committed {
 				return nil
@@ -29,15 +25,10 @@ func EchoTrafficFilter(client *moonitogo.Client) echo.MiddlewareFunc {
 	}
 }
 
-// Simple helper to extract client IP if you need in Echo side
+// GetClientIP is kept for compatibility. It returns Echo's RealIP, which
+// follows Echo's own IPExtractor configuration. The SDK itself resolves the
+// visitor address separately and never trusts a forwarded header from a
+// connection that is not a proxy.
 func GetClientIP(c echo.Context) string {
-	req := c.Request()
-	if cf := req.Header.Get("CF-Connecting-IP"); cf != "" {
-		return cf
-	}
-	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
 	return c.RealIP()
 }

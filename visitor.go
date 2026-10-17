@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -19,7 +20,7 @@ const (
 	passCookie          = "__mo_pass"
 	// SDKVersion is reported to the API so support can tell which build a
 	// customer is running.
-	SDKVersion = "1.3.0"
+	SDKVersion = "1.3.1"
 )
 
 // API response partial struct (adapted for the API contract)
@@ -35,6 +36,8 @@ type analyticsAPIResponse struct {
 			MaxAge int    `json:"max_age"`
 		} `json:"set_client_token"`
 		ChallengeURL string `json:"challenge_url"`
+		DecisionID   string `json:"decision_id"`
+		Nonce        string `json:"nonce"`
 	} `json:"data"`
 	Error *struct {
 		Message any `json:"message"`
@@ -137,7 +140,13 @@ func (c *Client) evaluateVisitor(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("analytics error: %v", apiResp.Error.Message)
 	}
 
-	writeClientToken(w, apiResp.Data.SetClientToken)
+	writeClientToken(w, apiResp.Data.SetClientToken, r.TLS != nil)
+	if apiResp.Data.DecisionID != "" && apiResp.Data.Nonce != "" {
+		http.SetCookie(w, &http.Cookie{
+			Name: "__mo_cx", Value: strings.ReplaceAll(url.QueryEscape(apiResp.Data.DecisionID+":"+apiResp.Data.Nonce), "+", "%20"),
+			Path: "/", MaxAge: 120, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil,
+		})
+	}
 
 	if apiResp.Data.Status.NeedToBlock {
 		c.handleBlockedVisitor(w, r)
@@ -284,13 +293,22 @@ func collectHeaders(r *http.Request) map[string]string {
 	return out
 }
 
+// Bound API strings by Unicode code points, without splitting UTF-8 sequences.
+func bounded(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) > limit {
+		runes = runes[:limit]
+	}
+	return string(runes)
+}
+
 // writeClientToken stores the token the API handed back, so the next request
 // from this visitor carries it.
 func writeClientToken(w http.ResponseWriter, descriptor *struct {
 	Name   string `json:"name"`
 	Value  string `json:"value"`
 	MaxAge int    `json:"max_age"`
-}) {
+}, secure bool) {
 	if descriptor == nil || descriptor.Value == "" {
 		return
 	}
@@ -311,6 +329,7 @@ func writeClientToken(w http.ResponseWriter, descriptor *struct {
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: false,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }

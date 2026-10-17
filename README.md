@@ -33,12 +33,17 @@ go mod init github.com/yourusername/yourproject
 Then install the SDK:
 
 ```bash
-go get github.com/moonito-net/moonito-go
+go get github.com/moonito-net/moonito-go@v1.3.1
 ```
 
 ---
 
 ## Quick Start (net/http)
+
+Version v1.3.1 bounds visitor input to the decision API limits and forwards
+sensor correlation through a short-lived response cookie. Existing API keys
+and settings remain compatible. Upgrade the module, rebuild, and redeploy the
+application to load the fix.
 
 ```go
 package main

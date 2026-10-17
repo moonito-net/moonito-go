@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -55,8 +56,8 @@ type visitorContext struct {
 func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string, ctx visitorContext) (string, error) {
 	body := map[string]any{
 		"ip":     ip,
-		"ua":     userAgent,
-		"events": event,
+		"ua":     bounded(userAgent, 2048),
+		"events": bounded(event, 4096),
 		"domain": domain,
 		"sdk":    "go/" + SDKVersion,
 	}
@@ -72,17 +73,27 @@ func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string, ctx vi
 	}
 
 	if ctx.Method != "" {
-		body["method"] = ctx.Method
+		body["method"] = bounded(ctx.Method, 16)
 	}
 
 	if ctx.Path != "" {
-		body["path"] = ctx.Path
+		body["path"] = bounded(ctx.Path, 512)
 	}
 
 	headers := map[string]string{}
-	for name, value := range ctx.Headers {
-		if len(value) <= 2048 {
-			headers[name] = value
+	names := make([]string, 0, len(ctx.Headers))
+	for name := range ctx.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		switch strings.ToLower(name) {
+		case "cookie", "authorization", "proxy-authorization":
+			continue
+		}
+		headers[name] = bounded(ctx.Headers[name], 2048)
+		if len(headers) >= 64 {
+			break
 		}
 	}
 	if len(headers) > 0 {
@@ -99,11 +110,7 @@ func (c *Client) requestAnalyticsAPI(ip, userAgent, event, domain string, ctx vi
 		return "", err
 	}
 
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
-	} else {
-		req.Header.Set("User-Agent", "moonito-go-sdk/"+SDKVersion)
-	}
+	req.Header.Set("User-Agent", "moonito-go-sdk/"+SDKVersion)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Public-Key", c.cfg.APIPublicKey)

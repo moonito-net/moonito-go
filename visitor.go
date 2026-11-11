@@ -20,7 +20,7 @@ const (
 	passCookie          = "__mo_pass"
 	// SDKVersion is reported to the API so support can tell which build a
 	// customer is running.
-	SDKVersion = "1.4.0"
+	SDKVersion = "1.5.0"
 )
 
 // API response partial struct (adapted for the API contract)
@@ -51,6 +51,11 @@ type analyticsAPIResponse struct {
 //	http.ListenAndServe(":3000", client.Middleware(mux))
 func (c *Client) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The sensor's own requests, answered before any decision.
+		if c.ServeRelay(w, r) {
+			return
+		}
+
 		tracked := &writeTracker{ResponseWriter: w}
 		_ = c.EvaluateVisitor(tracked, r)
 

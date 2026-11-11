@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testPage = `<!DOCTYPE html><html><head><title>Shop</title></head><body>Halo ñ 😀</body></html>`
@@ -66,8 +67,12 @@ func TestSensorIsAddedOnceWithCorrectLength(t *testing.T) {
 	if strings.Count(got, sensorMarker) != 1 {
 		t.Fatalf("sensor not added exactly once: %s", got)
 	}
-	if !strings.Contains(got, "sensor@1.1.1/t.js") || !strings.Contains(got, `data-key="pub_123"`) || !strings.Contains(got, "integrity=") {
+	param := New(Config{APIPublicKey: "pub_123"}).relayParam()
+	if !strings.Contains(got, `src="/?`+param+`=s&amp;v=`+sensorScriptVersion+`" data-endpoint="/"`) || !strings.Contains(got, `data-key="pub_123"`) || !strings.Contains(got, `data-p="`+param+`"`) {
 		t.Fatalf("tag incomplete: %s", got)
+	}
+	if strings.Contains(strings.ToLower(got), "moonito") || strings.Contains(got, "jsdelivr") {
+		t.Fatalf("the page names an outside host or the service: %s", got)
 	}
 	if strings.Index(got, sensorMarker) > strings.Index(got, "</head>") {
 		t.Fatal("tag not before </head>")
@@ -107,7 +112,7 @@ func TestSensorLeavesOtherResponsesAlone(t *testing.T) {
 		},
 		"csp": func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
-			w.Header().Set("Content-Security-Policy", "script-src 'self'")
+			w.Header().Set("Content-Security-Policy", "script-src https://cdn.example")
 			_, _ = io.WriteString(w, testPage)
 		},
 		"error": func(w http.ResponseWriter, r *http.Request) {
@@ -160,5 +165,151 @@ func TestApiDownStillAddsSensor(t *testing.T) {
 	res := serve(t, Config{IsProtected: true, APIPublicKey: "pub_123", APISecretKey: "s", Endpoint: "http://127.0.0.1:1"}, htmlHandler, nil)
 	if got := body(t, res); res.StatusCode != 200 || strings.Count(got, sensorMarker) != 1 {
 		t.Fatalf("fail-open visitor: status %d body %s", res.StatusCode, got)
+	}
+}
+
+func TestRelayAnswersTheSensorWithoutADecision(t *testing.T) {
+	decisions := 0
+	relayed := make(chan string, 1)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/telemetry/relay" {
+			b, _ := io.ReadAll(r.Body)
+			relayed <- r.Header.Get("X-Secret-Key") + " " + string(b)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		decisions++
+		_, _ = io.WriteString(w, `{"data":{"status":{"need_to_block":false}}}`)
+	}))
+	t.Cleanup(api.Close)
+
+	cfg := Config{IsProtected: true, APIPublicKey: "pub_123", APISecretKey: "s", Endpoint: api.URL}
+	param := New(cfg).relayParam()
+
+	script := serve(t, cfg, htmlHandler, nil)
+	_ = body(t, script)
+	decisions = 0
+
+	site := httptest.NewServer(New(cfg).Middleware(http.HandlerFunc(htmlHandler)))
+	t.Cleanup(site.Close)
+
+	res, err := http.Get(site.URL + "/shop?" + param + "=s&v=1.2.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != 200 || !strings.Contains(res.Header.Get("Content-Type"), "javascript") || string(got) != sensorScript {
+		t.Fatalf("script not served: %d %s", res.StatusCode, res.Header.Get("Content-Type"))
+	}
+	if strings.Contains(strings.ToLower(string(got)), "moonito") {
+		t.Fatal("the served script names the service")
+	}
+
+	res, _ = http.Get(site.URL + "/shop?" + param + "=p")
+	res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("ping answered %d", res.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, site.URL+"/shop?"+param+"=t", strings.NewReader(`{"k":"pub_123"}`))
+	req.Header.Set("X-Forwarded-For", "185.137.164.30")
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("beacon answered %d", res.StatusCode)
+	}
+
+	select {
+	case got := <-relayed:
+		if got != `s {"ip":"185.137.164.30","p":"{\"k\":\"pub_123\"}"}` {
+			t.Fatalf("relay carried %s", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("beacon was not relayed")
+	}
+
+	if decisions != 0 {
+		t.Fatalf("sensor requests cost %d decisions", decisions)
+	}
+
+	// A generic parameter is just a page.
+	res, _ = http.Get(site.URL + "/shop?__vt=s")
+	page, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if !strings.Contains(string(page), "Shop") || decisions != 1 {
+		t.Fatalf("a generic parameter was treated as the sensor's")
+	}
+
+	if New(Config{APIPublicKey: "pub_456"}).relayParam() == param {
+		t.Fatal("two sites share a parameter")
+	}
+}
+
+func TestSelfCSPStillGetsTheSensorWithThePagePath(t *testing.T) {
+	api := fakeAPI(t, false)
+	cfg := Config{IsProtected: true, APIPublicKey: "pub_123", APISecretKey: "s", Endpoint: api.URL}
+	site := httptest.NewServer(New(cfg).Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; object-src 'none'")
+		_, _ = io.WriteString(w, testPage)
+	})))
+	t.Cleanup(site.Close)
+	req, _ := http.NewRequest("GET", site.URL+"/shop/item?id=5", nil)
+	req.Header.Set("Accept", "text/html")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if !strings.Contains(string(got), `src="/shop/item?`) || !strings.Contains(string(got), `data-endpoint="/shop/item"`) {
+		t.Fatalf("self policy or page path not honoured: %s", got)
+	}
+}
+
+// A broken or missing API must never break the customer's page or the relay.
+func TestApiFaultsNeverBreakThePage(t *testing.T) {
+	modes := map[string]http.HandlerFunc{
+		"http500": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(500)
+			_, _ = io.WriteString(w, "<html>err</html>")
+		},
+		"garbage":    func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "\x00 not json {") },
+		"wrongshape": func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, `{"data":"x"}`) },
+		"empty":      func(w http.ResponseWriter, r *http.Request) {},
+	}
+	for name, handler := range modes {
+		api := httptest.NewServer(handler)
+		cfg := Config{IsProtected: true, APIPublicKey: "pub_123", APISecretKey: "s", Endpoint: api.URL}
+		site := httptest.NewServer(New(cfg).Middleware(http.HandlerFunc(htmlHandler)))
+		param := New(cfg).relayParam()
+
+		res, err := http.Get(site.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != 200 || !strings.Contains(string(got), "Halo") {
+			t.Errorf("%s: page broke: %d", name, res.StatusCode)
+		}
+
+		for _, body := range []string{`{"k":"pub_123"}`, "not json <<<", strings.Repeat("x", 20000), ""} {
+			res, err = http.Post(site.URL+"/?"+param+"=t", "text/plain", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
+			if res.StatusCode != http.StatusNoContent {
+				t.Errorf("%s: beacon answered %d", name, res.StatusCode)
+			}
+		}
+
+		site.Close()
+		api.Close()
 	}
 }

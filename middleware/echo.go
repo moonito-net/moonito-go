@@ -12,6 +12,11 @@ func EchoTrafficFilter(client *moonitogo.Client) echo.MiddlewareFunc {
 			// Quick skip for health or static endpoints if needed:
 			// if strings.HasPrefix(c.Request().URL.Path, "/health") { return next(c) }
 
+			// The sensor's own requests, answered before any decision.
+			if client.ServeRelay(c.Response(), c.Request()) {
+				return nil
+			}
+
 			// EvaluateVisitor fails open: when the check cannot run it logs
 			// the reason and the visitor continues. A protection problem must
 			// never become a 500 on the customer's site.

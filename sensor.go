@@ -2,19 +2,24 @@ package moonitogo
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The browser sensor this release adds to HTML pages (same as the PHP SDK).
 const (
-	sensorVersion  = "1.1.1"
-	sensorSRI      = "sha384-/7UZbqrpJUAKrkuftEAXE/7FurwiJ7NUyeokkvYnYClNLTXAvBCAKqo9pKzC1Zkv"
+	// A sensor tag pasted by hand from the CDN; recognised so it is never doubled.
 	sensorPath     = "/gh/moonito-net/sensor@"
 	sensorMarker   = "data-guard-sensor"
 	sensorMaxBytes = 5 << 20
+	maxBeacon      = 8192
 )
 
 var (
@@ -35,7 +40,7 @@ func (c *Client) WithSensor(w http.ResponseWriter, r *http.Request) (http.Respon
 		return w, func() {}
 	}
 
-	s := &sensorWriter{ResponseWriter: w, client: c, status: http.StatusOK}
+	s := &sensorWriter{ResponseWriter: w, client: c, status: http.StatusOK, path: pagePath(r)}
 
 	return s, s.finish
 }
@@ -43,17 +48,82 @@ func (c *Client) WithSensor(w http.ResponseWriter, r *http.Request) (http.Respon
 // InsertSensor returns the page with the sensor tag added, or ok=false when it
 // should be left alone (already tagged, a meta CSP, no head or body).
 func (c *Client) InsertSensor(html string) (string, bool) {
+	return c.insertSensorAt(html, "")
+}
+
+var safePath = regexp.MustCompile(`^/[^\s"<>\\]*$`)
+
+// pagePath is this page's own path, known to reach this SDK. Written into the
+// tag so the sensor always comes back to it, even on a page with a <base href>
+// or after a single-page app changes the address.
+func pagePath(r *http.Request) string {
+	p := r.URL.EscapedPath()
+	if len(p) > 2048 || !safePath.MatchString(p) {
+		return "/"
+	}
+	return p
+}
+
+// cspAllowsSelf reports whether a Content-Security-Policy lets the sensor run.
+// It is served from the site itself, so 'self' for scripts and requests is all
+// it needs. A policy built on nonces or 'strict-dynamic' is left alone.
+func cspAllowsSelf(header string) bool {
+	if header == "" {
+		return true
+	}
+
+	directives := map[string][]string{}
+	for _, part := range strings.Split(header, ";") {
+		tokens := strings.Fields(strings.ToLower(part))
+		if len(tokens) == 0 {
+			continue
+		}
+		if _, seen := directives[tokens[0]]; !seen {
+			directives[tokens[0]] = tokens[1:]
+		}
+	}
+
+	pick := func(names ...string) []string {
+		for _, n := range names {
+			if v, ok := directives[n]; ok {
+				return v
+			}
+		}
+		return nil
+	}
+	has := func(list []string, want string) bool {
+		for _, v := range list {
+			if v == want {
+				return true
+			}
+		}
+		return false
+	}
+	allows := func(list []string) bool {
+		return list == nil || (!has(list, "'none'") && (has(list, "'self'") || has(list, "*")))
+	}
+
+	script := pick("script-src-elem", "script-src", "default-src")
+	connect := pick("connect-src", "default-src")
+
+	return !has(script, "'strict-dynamic'") && allows(script) && allows(connect)
+}
+
+func (c *Client) insertSensorAt(html, path string) (string, bool) {
 	if html == "" || strings.Contains(html, sensorPath) || strings.Contains(html, sensorMarker) || metaCSP.MatchString(html) {
 		return html, false
 	}
 
+	// Served by this SDK from the page's own URL (ServeRelay): no other
+	// host, nothing that names the service.
+	param := c.relayParam()
+	at := htmlEscape(path)
 	endpoint := ""
-	if e := strings.TrimRight(c.cfg.Endpoint, "/"); e != "" && e != "https://moonito.net" {
-		endpoint = ` data-endpoint="` + htmlEscape(e) + `"`
+	if at != "" {
+		endpoint = ` data-endpoint="` + at + `"`
 	}
-
-	tag := `<script defer src="https://cdn.jsdelivr.net` + sensorPath + sensorVersion + `/t.js" integrity="` + sensorSRI +
-		`" crossorigin="anonymous" data-key="` + htmlEscape(c.cfg.APIPublicKey) + `"` + endpoint + ` ` + sensorMarker + `></script>`
+	tag := `<script defer src="` + at + `?` + param + `=s&amp;v=` + sensorScriptVersion + `"` + endpoint + ` data-key="` + htmlEscape(c.cfg.APIPublicKey) +
+		`" data-p="` + param + `" ` + sensorMarker + `></script>`
 
 	if loc := headClose.FindStringIndex(html); loc != nil {
 		return html[:loc[0]] + tag + html[loc[0]:], true
@@ -104,6 +174,7 @@ type sensorWriter struct {
 	mode        int
 	buf         bytes.Buffer
 	passStarted bool
+	path        string
 }
 
 func (s *sensorWriter) decide(first []byte) {
@@ -121,7 +192,7 @@ func (s *sensorWriter) decide(first []byte) {
 	skip := s.status < 200 || s.status >= 300 || s.status == http.StatusNoContent ||
 		!strings.Contains(strings.ToLower(h.Get("Content-Type")), "text/html") ||
 		h.Get("Content-Encoding") != "" ||
-		h.Get("Content-Security-Policy") != "" ||
+		!cspAllowsSelf(h.Get("Content-Security-Policy")) ||
 		strings.Contains(strings.ToLower(h.Get("Content-Disposition")), "attachment")
 
 	if skip {
@@ -218,7 +289,7 @@ func (s *sensorWriter) finish() {
 	case sensorBuffer:
 		body := s.buf.Bytes()
 
-		if page, ok := s.client.InsertSensor(string(body)); ok {
+		if page, ok := s.client.insertSensorAt(string(body), s.path); ok {
 			body = []byte(page)
 
 			if s.Header().Get("Content-Length") != "" {
@@ -231,4 +302,100 @@ func (s *sensorWriter) finish() {
 		s.buf.Reset()
 		s.mode = sensorPass
 	}
+}
+
+// relayParam is the query parameter the sensor's requests use on this site.
+// Derived from the public key, so every site has its own: no URL pattern an ad
+// blocker list could match across customers, and no clash with the site's own
+// parameters. Same rule in every SDK.
+func (c *Client) relayParam() string {
+	sum := sha256.Sum256([]byte("sensor|" + c.cfg.APIPublicKey))
+	return "_" + hex.EncodeToString(sum[:])[:7]
+}
+
+// relayKind is "s" (script), "p" (ping), "t" (beacon), or "" for any other request.
+func (c *Client) relayKind(r *http.Request) string {
+	param := c.relayParam()
+	if !strings.Contains(r.URL.RawQuery, param+"=") {
+		return ""
+	}
+
+	kind := r.URL.Query().Get(param)
+	switch {
+	case (kind == "s" || kind == "p") && (r.Method == http.MethodGet || r.Method == http.MethodHead):
+		return kind
+	case kind == "t" && r.Method == http.MethodPost:
+		return "t"
+	}
+
+	return ""
+}
+
+// ServeRelay answers the browser sensor's own requests (its script, timing and
+// beacon), which come to the page's own URL. It returns true when it answered,
+// and then the request needs nothing else. Middleware and the Echo middleware
+// call it before any decision, so the browser only ever talks to this site.
+func (c *Client) ServeRelay(w http.ResponseWriter, r *http.Request) bool {
+	if c.cfg.DisableSensor || !c.cfg.IsProtected || c.cfg.APIPublicKey == "" {
+		return false
+	}
+
+	switch c.relayKind(r) {
+	case "s":
+		h := w.Header()
+		h.Set("Content-Type", "application/javascript; charset=utf-8")
+		// Versioned URL, so the browser keeps it for a year.
+		h.Set("Cache-Control", "public, max-age=31536000, immutable")
+		h.Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = io.WriteString(w, sensorScript)
+		}
+		return true
+	case "p":
+		w.Header().Set("Cache-Control", "no-store, private")
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	case "t":
+		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBeacon+1))
+		w.Header().Set("Cache-Control", "no-store, private")
+		w.WriteHeader(http.StatusNoContent)
+		if len(body) > 0 && len(body) <= maxBeacon {
+			// After the browser has its answer.
+			go c.relayBeacon(c.clientIP(r), string(body))
+		}
+		return true
+	}
+
+	return false
+}
+
+var relayHTTP = &http.Client{Timeout: 2 * time.Second}
+
+// relayBeacon forwards a sensor beacon to Moonito, server to server.
+func (c *Client) relayBeacon(ip, beacon string) {
+	if !isValidIP(ip) || beacon == "" {
+		return
+	}
+
+	payload, err := json.Marshal(map[string]string{"ip": ip, "p": beacon})
+	if err != nil {
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.endpoint()+"/api/v2/telemetry/relay", bytes.NewReader(payload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "moonito-go-sdk/"+SDKVersion)
+	req.Header.Set("X-Public-Key", c.cfg.APIPublicKey)
+	req.Header.Set("X-Secret-Key", c.cfg.APISecretKey)
+
+	resp, err := relayHTTP.Do(req)
+	if err != nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 }

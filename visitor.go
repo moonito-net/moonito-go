@@ -20,7 +20,7 @@ const (
 	passCookie          = "__mo_pass"
 	// SDKVersion is reported to the API so support can tell which build a
 	// customer is running.
-	SDKVersion = "1.3.1"
+	SDKVersion = "1.4.0"
 )
 
 // API response partial struct (adapted for the API contract)
@@ -58,7 +58,9 @@ func (c *Client) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		page, finish := c.WithSensor(w, r)
+		defer finish()
+		next.ServeHTTP(page, r)
 	})
 }
 

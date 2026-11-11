@@ -27,6 +27,12 @@ type Config struct {
 	// IPs or CIDR ranges) whose X-Forwarded-For may be believed. Private
 	// addresses and Cloudflare are recognised without being listed.
 	TrustedProxies []string
+
+	// DisableSensor stops the browser sensor being added to HTML pages. By
+	// default Middleware and the Echo middleware add it for every visitor
+	// they let through, so there is no separate script to paste. Pages with a
+	// Content-Security-Policy, compressed or flushed responses are left alone.
+	DisableSensor bool
 }
 
 // Client is the main SDK client.

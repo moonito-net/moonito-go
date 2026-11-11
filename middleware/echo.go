@@ -20,6 +20,12 @@ func EchoTrafficFilter(client *moonitogo.Client) echo.MiddlewareFunc {
 			if c.Response().Committed {
 				return nil
 			}
+
+			// The browser sensor, added to the HTML page the route writes.
+			page, finish := client.WithSensor(c.Response().Writer, c.Request())
+			c.Response().Writer = page
+			defer finish()
+
 			return next(c)
 		}
 	}

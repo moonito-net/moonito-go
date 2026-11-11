@@ -33,17 +33,18 @@ go mod init github.com/yourusername/yourproject
 Then install the SDK:
 
 ```bash
-go get github.com/moonito-net/moonito-go@v1.3.1
+go get github.com/moonito-net/moonito-go@v1.4.0
 ```
 
 ---
 
 ## Quick Start (net/http)
 
-Version v1.3.1 bounds visitor input to the decision API limits and forwards
-sensor correlation through a short-lived response cookie. Existing API keys
-and settings remain compatible. Upgrade the module, rebuild, and redeploy the
-application to load the fix.
+Since v1.4.0, `Middleware` and the Echo middleware add the browser sensor to
+your HTML pages automatically, so there is no separate script to paste. Pages
+with a Content-Security-Policy, compressed or flushed responses are left
+alone. Set `DisableSensor: true` in `Config` to turn it off. If you pasted the
+sensor tag into a template before, you can remove it; it is never added twice.
 
 ```go
 package main
